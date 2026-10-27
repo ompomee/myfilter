@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pre-Open Filter — ≥2% Change</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 18px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    background: #1e293b; padding: 14px; border-radius: 10px; margin-bottom: 18px;
+  }
+  .controls label { font-size: 13px; color: #cbd5e1; }
+  input[type="number"] {
+    width: 80px; padding: 6px 8px; border-radius: 6px; border: 1px solid #334155;
+    background: #0f172a; color: #e2e8f0; font-size: 14px;
+  }
+  input[type="file"] { color: #cbd5e1; font-size: 13px; }
+  .stats { font-size: 13px; color: #94a3b8; margin-bottom: 12px; }
+  .stats b { color: #38bdf8; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    background: #1e293b; border-radius: 10px; overflow: hidden;
+  }
+  th, td { padding: 9px 12px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    background: #334155; color: #f1f5f9; font-weight: 600;
+    position: sticky; top: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+  }
+  tbody tr { border-bottom: 1px solid #273449; }
+  tbody tr:hover { background: #263449; }
+  .up   { color: #4ade80; font-weight: 600; }
+  .down { color: #f87171; font-weight: 600; }
+  .empty { color: #94a3b8; padding: 30px; text-align: center; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge.up { background: #14532d; color: #86efac; }
+  .badge.down { background: #7f1d1d; color: #fca5a5; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Pre-Open Market Filter</h1>
+<div class="sub">Upload the MW-Pre-Open-Market CSV → shows stocks with daily change ≥ threshold (default 2%).</div>
+
+<div class="controls">
+  <label>Threshold (%): <input id="threshold" type="number" value="2" min="0" step="0.1"></label>
+  <label><input id="absOnly" type="checkbox" checked> Absolute value (|%|)</label>
+  <input id="fileInput" type="file" accept=".csv,text/csv">
+</div>
+
+<div class="stats" id="stats">No file loaded.</div>
+
+<table id="resultTable" class="hidden">
+  <thead>
+    <tr>
+      <th>Symbol</th>
+      <th>Prev Close</th>
+      <th>Final Price</th>
+      <th>Change (₹)</th>
+      <th>% Change</th>
+      <th>Final Volume</th>
+      <th>Value (₹ Cr)</th>
+      <th>52W High</th>
+      <th>52W Low</th>
+    </tr>
+  </thead>
+  <tbody id="tbody"></tbody>
+</table>
+
+<div id="empty" class="empty">Upload a CSV file to begin.</div>
+
+<script>
+// ---------- CSV parser (handles quoted commas) ----------
+function parseCSV(text) {
+  // strip BOM
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(field); field = ''; }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+      else if (c === '\r') { /* skip */ }
+      else field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Parse a number that may be like "1,097.50" or "-" or "10,97,361"
+function num(v) {
+  if (v == null) return NaN;
+  v = String(v).trim();
+  if (v === '' || v === '-') return NaN;
+  v = v.replace(/,/g, '');     // remove Indian & Western commas
+  const n = parseFloat(v);
+  return isNaN(n) ? NaN : n;
+}
+
+// Indian group formatting for volume (10,97,361) — simple toLocaleString
+function fmtQty(n) {
+  if (isNaN(n)) return '—';
+  return n.toLocaleString('en-IN');
+}
+function fmtPrice(n) {
+  if (isNaN(n)) return '—';
+  return n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtSigned(n) {
+  if (isNaN(n)) return '—';
+  const s = n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n > 0 ? '+' + s : s;
+}
+
+// ---------- State ----------
+let allRows = []; // objects with parsed values
+
+// ---------- Render ----------
+const tbody = document.getElementById('tbody');
+const table = document.getElementById('resultTable');
+const empty = document.getElementById('empty');
+const stats = document.getElementById('stats');
+
+function render() {
+  const threshold = parseFloat(document.getElementById('threshold').value) || 0;
+  const useAbs = document.getElementById('absOnly').checked;
+
+  const filtered = allRows.filter(r => {
+    if (isNaN(r.pct)) return false;
+    return useAbs ? Math.abs(r.pct) >= threshold : r.pct >= threshold;
+  });
+
+  // sort by % change descending (gainers first)
+  filtered.sort((a, b) => b.pct - a.pct);
+
+  const gainers = filtered.filter(r => r.pct > 0).length;
+  const losers  = filtered.filter(r => r.pct < 0).length;
+
+  stats.innerHTML =
+    `Loaded <b>${allRows.length}</b> stocks · Matching <b>${filtered.length}</b> ` +
+    `(<span class="up">${gainers} up</span>, <span class="down">${losers} down</span>) ` +
+    `· Threshold: <b>${useAbs ? '|' : ''}${threshold}%${useAbs ? '|' : ''}</b>`;
+
+  tbody.innerHTML = '';
+  if (!filtered.length) {
+    table.classList.add('hidden');
+    empty.classList.remove('hidden');
+    empty.textContent = allRows.length ? 'No stocks match the threshold.' : 'Upload a CSV file to begin.';
+    return;
+  }
+  table.classList.remove('hidden');
+  empty.classList.add('hidden');
+
+  const frag = document.createDocumentFragment();
+  for (const r of filtered) {
+    const tr = document.createElement('tr');
+    const cls = r.pct > 0 ? 'up' : (r.pct < 0 ? 'down' : '');
+    tr.innerHTML = `
+      <td><b>${r.symbol}</b></td>
+      <td>${fmtPrice(r.prevClose)}</td>
+      <td>${fmtPrice(r.finalPrice)}</td>
+      <td class="${cls}">${fmtSigned(r.change)}</td>
+      <td><span class="badge ${cls}">${r.pct > 0 ? '+' : ''}${r.pct.toFixed(2)}%</span></td>
+      <td>${fmtQty(r.volume)}</td>
+      <td>${isNaN(r.value) ? '—' : r.value.toLocaleString('en-IN', {maximumFractionDigits: 2})}</td>
+      <td>${fmtPrice(r.high52)}</td>
+      <td>${fmtPrice(r.low52)}</td>
+    `;
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+}
+
+// ---------- File load ----------
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const rows = parseCSV(reader.result);
+      if (!rows.length) { alert('Empty file'); return; }
+
+      const header = rows[0].map(h => h.trim().toUpperCase());
+      const idx = (name) => header.findIndex(h => h === name);
+      const cSym = idx('SYMBOL');
+      const cPrev = idx('PREV. CLOSE');
+      const cFinal = idx('FINAL PRICE');
+      const cChg = idx('CHANGE');
+      const cPct = idx('%CHANGE');
+      const cVol = idx('FINAL VOLUME');
+      const cVal = idx('VALUE (₹ CRORES)');
+      const cHi = idx('52 WEEK HIGH');
+      const cLo = idx('52 WEEK LOW');
+
+      if (cSym < 0 || cPct < 0) {
+        alert('Could not find SYMBOL or %CHANGE columns in the header.');
+        return;
+      }
+
+      allRows = [];
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row || row.length < 2) continue;
+        const symbol = (row[cSym] || '').trim();
+        if (!symbol) continue;
+
+        allRows.push({
+          symbol,
+          prevClose:  num(row[cPrev]),
+          finalPrice: num(row[cFinal]),
+          change:     num(row[cChg]),
+          pct:        num(row[cPct]),
+          volume:     num(row[cVol]),
+          value:      num(row[cVal]),
+          high52:     num(row[cHi]),
+          low52:      num(row[cLo]),
+        });
+      }
+
+      render();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to parse CSV: ' + err.message);
+    }
+  };
+  reader.readAsText(file, 'UTF-8');
+});
+
+// re-render on control changes
+document.getElementById('threshold').addEventListener('input', render);
+document.getElementById('absOnly').addEventListener('change', render);
+</script>
+</body>
+</html>
